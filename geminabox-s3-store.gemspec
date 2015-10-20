@@ -8,6 +8,7 @@ Gem::Specification.new do |s|
   s.email       = 'kbourn@gmail.com'
   s.files       = [
     "lib/geminabox-s3-store.rb",
+    "lib/geminabox/cache/s3.rb",
     "lib/geminabox/store/s3.rb"
   ]
   s.homepage    =

@@ -3,12 +3,12 @@ module Geminabox
     class S3
       attr_reader :logger
 
-      SPLICEABLE_GZIPPED_FILES = %w[
+      GZIPPED_FILES = %w[
         specs.4.8.gz
         latest_specs.4.8.gz
         prerelease_specs.4.8.gz
       ]
-      SPLICEABLE_TEXT_FILES = %w[
+      TEXT_FILES = %w[
         yaml
         Marshal.4.8
         specs.4.8
@@ -21,19 +21,73 @@ module Geminabox
         @file_store = file_store
         @lock_manager = lock_manager
         @logger = logger
+        @local_and_remote_metadata_lock = Mutex.new
+        @local_metadata_lock = Mutex.new
+        # Check if local metadata needs an update from S3 on start.
+        update_local_metadata
       end
 
       def create(gem, overwrite = false)
-        @file_store.create gem, overwrite
+        @local_and_remote_metadata_lock.synchronize do
+          @lock_manager.lock "geminabox-upload" do
+            update_local_metadata
 
-        object_name = gem_object_name("/gems/" + gem.name)
+            @file_store.create gem, overwrite
 
-        logger.info "Gem: local -> S3 #{object_name}"
+            object_name = gem_object_name("/gems/" + gem.name)
 
-        @bucket
-          .objects[object_name]
-          .write gem.gem_data
-        update_metadata
+            logger.info "Gem: local -> S3 #{object_name}"
+
+            @bucket
+              .objects[object_name]
+              .write gem.gem_data
+            update_metadata
+          end
+        end
+      end
+
+      def access_metadata
+        logger.info "access_metadata hook"
+        update_local_metadata
+        logger.info "access_metadata hook completed"
+      end
+
+      # Get the last file from TEXT_FILES (last upload that takes place),
+      # and compare local vs remote timestamps.
+      # true if remote is newer than local.
+      def check_if_remote_metadata_changed
+        object_to_check = TEXT_FILES.last
+        remote_last_modified = nil
+        begin
+          remote_last_modified = @bucket.objects[metadata_object_name('/' + object_to_check)].last_modified
+        rescue AWS::S3::Errors::NoSuchKey => e
+          # No remote metadata, local (if any) is most up to date.
+          logger.info "No metadata exists on S3, skipping retrieval."
+          return false
+        end
+        local_file = @file_store.local_path object_to_check
+        return true unless File.exist? local_file
+        if File.mtime(local_file) < remote_last_modified
+          true
+        else
+          false
+        end
+      end
+
+      def update_local_metadata
+        @local_metadata_lock.synchronize do
+          if check_if_remote_metadata_changed
+            logger.info "Local metadata is out of date, repopulating from S3."
+            if ! Dir.exist? Geminabox.data
+              logger.info "Local data directory does not exist, creating it."
+              file_store_obj = @file_store.new(nil, nil)
+              file_store_obj.prepare_data_folders
+            end
+            (GZIPPED_FILES + TEXT_FILES).each do |metadata_filename|
+              update_local_metadata_file(metadata_filename)
+            end
+          end
+        end
       end
 
       # Note: deleting doesn't make much sense in this case anyway, as
@@ -71,13 +125,7 @@ module Geminabox
 
       def update_local_metadata_file(path_info)
         file_name = File.basename path_info
-        pull_file file_name do |local, remote|
-          if file_name =~ /\.gz$/
-            merge_gzipped local, remote
-          else
-            merge_text local, remote
-          end
-        end
+        pull_file file_name
       end
 
       def reindex &block
@@ -104,36 +152,14 @@ module Geminabox
       private
 
       def update_metadata
-        @lock_manager.lock ".metadata" do
-          push_files SPLICEABLE_GZIPPED_FILES do |local_contents, remote_contents|
-            merge_gzipped local_contents, remote_contents
-          end
+        push_files GZIPPED_FILES
 
-          push_files SPLICEABLE_TEXT_FILES do |local_contents, remote_contents|
-            merge_text local_contents, remote_contents
-          end
-        end
+        push_files TEXT_FILES
       end
 
-      def push_files file_list, &block
+      def push_files file_list
         file_list.each do |file_name|
-          push_file file_name, &block
-        end
-      end
-
-      def merge_file_with_remote file_name
-        local_index_file = @file_store.local_path file_name
-        if File.exists? local_index_file
-          old_contents = File.read(local_index_file, open_args: ["rb"])
-        else
-          old_contents = ''
-        end
-
-        object = s3_object(file_name)
-        unless object.exists?
-          old_contents
-        else
-          yield old_contents, object.read
+          push_file file_name
         end
       end
 
@@ -142,19 +168,27 @@ module Geminabox
         @bucket.objects[object_name]
       end
 
-      def push_file file_name, &block
+      def push_file file_name
         logger.info "Push: local -> S3 #{file_name}"
 
-        new_contents = merge_file_with_remote file_name, &block
-        s3_object(file_name).write new_contents
+        file_path = @file_store.local_path file_name
+        if File.exist? file_path
+          s3_object(file_name).write IO.read(file_path)
+        else
+          logger.info "File '#{file_path}' does not exist. Pushing an empty string to S3 instead."
+          s3_object(file_name).write ""
+        end
       end
 
-      def pull_file file_name, &block
+      def pull_file file_name
         logger.info "Pull: S3 -> local #{file_name}"
 
-        new_contents = merge_file_with_remote file_name, &block
         file_path = @file_store.local_path file_name
-        File.write file_path, new_contents
+        File.open(file_path, 'wb') do |file|
+          s3_object(file_name).read do |chunk|
+            file.write(chunk)
+          end
+        end
       end
 
       def gem_object_name(path_info)
@@ -164,22 +198,6 @@ module Geminabox
 
       def metadata_object_name(path_info)
         path_info.gsub %r{/}, 'metadata/'
-      end
-
-      def merge_gzipped(a, b)
-        package(unpackage(a) | unpackage(b))
-      end
-
-      def merge_text(a, b)
-        a.to_s + b.to_s
-      end
-
-      def unpackage(content)
-        Marshal.load(Gem.gunzip(content))
-      end
-
-      def package(content)
-        Gem.gzip(Marshal.dump(content))
       end
     end
   end

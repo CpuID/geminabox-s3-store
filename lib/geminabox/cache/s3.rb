@@ -15,8 +15,8 @@ module Geminabox
       def pre_read(file_name)
         file_basename = File.basename(file_name)
         s3_key = s3_object(file_basename)
-        if @bucket.objects[s3_key].exists?
-          if File.exist? file_name and @bucket.objects[s3_key].last_modified > File.mtime file_name
+        if ! File.exist?(file_name)
+          if @bucket.objects[s3_key].exists?
             File.open(file_name, 'wb') do |file|
               @bucket.objects[s3_key].read do |chunk|
                 file.write(chunk)
@@ -24,10 +24,10 @@ module Geminabox
             end
             logger.info "#{s3_key} found on S3, written out to #{file_name}"
           else
-            logger.info "#{s3_key} found on S3, but identical modification time to local, not downloading."
+            logger.info "#{s3_key} does not exist on S3, not retrieving."
           end
         else
-          logger.info "#{s3_key} does not exist on S3, not retrieving."
+          logger.info "#{file_basename} exists locally, not retrieving from S3."
         end
       end
 
